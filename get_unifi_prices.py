@@ -42,16 +42,24 @@ MIN_PRICED_RATIO = float(os.getenv("UNIFI_MIN_PRICED_RATIO", "0.70"))
 
 # These nine broad routes cover the current UniFi catalog. Product rows are
 # deduplicated across categories by product slug before CSV generation.
-CATEGORIES: dict[str, str] = {
-    "Cloud Gateways": "category/all-cloud-gateways",
-    "Switching": "category/all-switching",
-    "WiFi": "category/all-wifi",
-    "Physical Security": "category/all-cameras-nvrs",
-    "Door Access": "category/all-door-access",
-    "Integrations": "category/all-integrations",
-    "Advanced Hosting": "category/all-advanced-hosting",
-    "Accessories": "category/accessories-cables-dacs",
-    "Network Storage": "category/network-storage",
+# Each category can have one or more candidate routes. UniFi occasionally
+# renames storefront category slugs while leaving the underlying JSON format
+# unchanged. The scraper tries candidates in order and uses the first one that
+# returns products.
+CATEGORY_ROUTES: dict[str, tuple[str, ...]] = {
+    "Cloud Gateways": ("category/all-cloud-gateways",),
+    "Switching": ("category/all-switching",),
+    "WiFi": ("category/all-wifi",),
+    # Current CA route first; legacy route retained as a fallback.
+    "Physical Security": (
+        "category/all-physical-security",
+        "category/all-cameras-nvrs",
+    ),
+    "Door Access": ("category/all-door-access",),
+    "Integrations": ("category/all-integrations",),
+    "Advanced Hosting": ("category/all-advanced-hosting",),
+    "Accessories": ("category/accessories-cables-dacs",),
+    "Network Storage": ("category/network-storage",),
 }
 
 CSV_FIELDS = [
@@ -228,15 +236,37 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
 
     by_slug: dict[str, dict[str, Any]] = {}
 
-    for index, (category_label, route) in enumerate(CATEGORIES.items(), start=1):
-        print(f"Fetching category {index}/{len(CATEGORIES)}: {category_label}")
-        products, build_id, store_origin = fetch_category(
-            session=session,
-            store_origin=store_origin,
-            build_id=build_id,
-            category_label=category_label,
-            route=route,
-        )
+    for index, (category_label, routes) in enumerate(CATEGORY_ROUTES.items(), start=1):
+        print(f"Fetching category {index}/{len(CATEGORY_ROUTES)}: {category_label}")
+
+        products: list[dict[str, Any]] | None = None
+        route_errors: list[str] = []
+
+        for route_index, route in enumerate(routes, start=1):
+            try:
+                candidate_products, build_id, store_origin = fetch_category(
+                    session=session,
+                    store_origin=store_origin,
+                    build_id=build_id,
+                    category_label=category_label,
+                    route=route,
+                )
+                products = candidate_products
+                if route_index > 1:
+                    print(f"  using fallback route: {route}")
+                break
+            except RuntimeError as exc:
+                route_errors.append(f"{route}: {exc}")
+                if route_index < len(routes):
+                    print(f"  route {route} returned no usable catalog; trying fallback")
+                    continue
+                raise RuntimeError(
+                    f"{category_label} failed on every known route: "
+                    + " | ".join(route_errors)
+                ) from exc
+
+        if products is None:
+            raise RuntimeError(f"{category_label} produced no product list")
 
         category_new = 0
         for product in products:
@@ -255,10 +285,10 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
             f"{category_new} new unique slugs"
         )
 
-        if CATEGORY_DELAY_SECONDS > 0 and index < len(CATEGORIES):
+        if CATEGORY_DELAY_SECONDS > 0 and index < len(CATEGORY_ROUTES):
             time.sleep(CATEGORY_DELAY_SECONDS)
 
-    print(f"Fetched {len(by_slug)} unique products from {len(CATEGORIES)} category requests")
+    print(f"Fetched {len(by_slug)} unique products from {len(CATEGORY_ROUTES)} logical categories")
     return by_slug
 
 
