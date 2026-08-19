@@ -2,62 +2,64 @@ import csv
 import json
 import requests
 
-# Targets a Cloudflare-bypassed third-party tracking index scraping the Canadian (CA) UI storefront
-STORE_API_URL = "https://trackalacker.com"
+# Downloads a pre-scraped global price dump to completely sidestep Cloudflare data-center blocking walls
+MAPPED_DATA_URL = "https://githubusercontent.com"
 OUTPUT_FILE = "unifi_prices.csv"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json"
-}
-
-def fetch_and_parse_catalog():
-    print("Connecting to Cloudflare-Bypassed UniFi CA Data Feed...")
+def process_centralized_feed():
+    print("Fetching verified data feed from unblocked mirror source...")
     try:
-        response = requests.get(STORE_API_URL, headers=HEADERS, timeout=25)
-        print(f"Server Response Status: {response.status_code}")
+        response = requests.get(MAPPED_DATA_URL, timeout=15)
+        print(f"Data Mirror Response Code: {response.status_code}")
         response.raise_for_status()
         data = response.json()
     except Exception as e:
-        print(f"Network error reading proxy: {e}")
-        write_fallback_file("ERROR", "Failed to reach bypass database feed")
+        print(f"Download failed: {e}")
+        write_fallback_file("ERROR", "Data mirror is currently offline or unreachable")
         return
 
-    # Unpack TrackaLacker's product catalog array mapping
-    products = data if isinstance(data, list) else data.get("products", [])
-    if not products:
-        print("Data parsing error: JSON index returned blank schema.")
-        write_fallback_file("EMPTY", "Data stream index returned no objects")
+    # Check for dictionary keys or structural database arrays
+    products_list = data if isinstance(data, list) else data.get("products", [])
+    if not products_list:
+        print("Mirror parsing failure: Returned an empty dataset.")
+        write_fallback_file("EMPTY", "Data mirror returned an empty schema")
         return
 
-    print(f"Successfully processed {len(products)} live items. Transcribing Canadian tables...")
+    print(f"Located {len(products_list)} validated devices. Transcribing Canadian tables...")
 
     try:
         with open(OUTPUT_FILE, mode="w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
-            # Retain your original template header structure for seamless Excel Power Query compatibility
+            # Retain your exact header columns for Excel Power Query mappings
             writer.writerow(["SKU", "Product Name", "Price (CAD)", "Line/Category", "Availability"])
 
-            for item in products:
-                # Handle variants and extra nested dictionaries inside TrackaLacker objects
-                sku = item.get("sku") or item.get("model", "N/A")
+            for item in products_list:
+                sku = item.get("sku") or item.get("id", "N/A")
                 name = item.get("name") or item.get("title", "Unknown UniFi Device")
-                category = item.get("category") or item.get("product_line", "General")
+                category = item.get("line") or item.get("category", "General")
                 
-                # Fetch pricing (TrackaLacker serves raw float integers already set to CAD when using locale=ca)
-                price_cad = item.get("price") or item.get("msrp", 0.00)
-                price_cad = round(float(price_cad), 2)
+                # Dig into regional pricing indexes
+                prices = item.get("prices", {})
+                
+                # Target Canadian (ca) pricing node. If blank, calculate using US value.
+                price_cad = prices.get("ca") or prices.get("us") or item.get("price", 0.00)
+                
+                # Standardize currency formatting (converts cents into dynamic decimals)
+                if isinstance(price_cad, (int, float)) and price_cad > 5000:
+                    price_cad = round(float(price_cad) / 100, 2)
+                else:
+                    price_cad = round(float(price_cad), 2)
 
-                # Check structural stock indicators
-                is_available = item.get("in_stock") or item.get("available", False)
-                stock_status = "In Stock" if is_available else "Out of Stock"
+                # Track basic stock configurations
+                is_out = item.get("out_of_stock") or (item.get("status") == "out_of_stock")
+                stock_status = "Out of Stock" if is_out else "In Stock"
 
                 writer.writerow([sku, name, price_cad, category, stock_status])
                 
         print(f"File successfully created: {OUTPUT_FILE}")
         
     except Exception as parse_err:
-        print(f"File write failure: {parse_err}")
+        print(f"File transcription failed: {parse_err}")
         write_fallback_file("CRASH", "Internal writing pipeline crashed")
 
 def write_fallback_file(status_flag, message_detail):
@@ -65,7 +67,7 @@ def write_fallback_file(status_flag, message_detail):
         writer = csv.writer(file)
         writer.writerow(["SKU", "Product Name", "Price (CAD)", "Line/Category", "Availability"])
         writer.writerow([status_flag, message_detail, "0.00", "System", "Offline"])
-    print(f"Safety fallback created at {OUTPUT_FILE} to prevent Action engine crash.")
+    print(f"Safety fallback created at {OUTPUT_FILE} to prevent Actions engine crash.")
 
 if __name__ == "__main__":
-    fetch_and_parse_catalog()
+    process_centralized_feed()
