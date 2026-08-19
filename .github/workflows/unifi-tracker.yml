@@ -2,7 +2,7 @@ name: Update UniFi Prices
 
 on:
   schedule:
-    # Daily at 06:00 UTC.
+    # Once daily is plenty for an estimating/quotation workbook.
     - cron: "0 6 * * *"
   workflow_dispatch:
 
@@ -14,46 +14,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  scrape-and-publish:
+  fetch-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
 
-      - name: Install Chromium for Playwright
-        run: python -m playwright install --with-deps chromium
-
-      - name: Scrape Canadian UniFi Store
+      - name: Fetch Canadian UniFi catalog prices
         env:
-          UNIFI_MIN_PRODUCTS: "40"
+          UNIFI_MIN_PRODUCTS: "100"
+          UNIFI_MIN_PRICED_RATIO: "0.70"
+          UNIFI_CATEGORY_DELAY: "0.25"
         run: python get_unifi_prices.py
 
-      - name: Verify generated CSV exists
+      - name: Verify generated CSV
         run: |
           test -s unifi_prices.csv
           python - <<'PY'
           import csv
+          from decimal import Decimal
           from pathlib import Path
 
           path = Path("unifi_prices.csv")
           with path.open(newline="", encoding="utf-8") as f:
               rows = list(csv.DictReader(f))
 
-          if len(rows) < 40:
+          if len(rows) < 100:
               raise SystemExit(f"Refusing to publish only {len(rows)} rows")
+
+          required = {
+              "SKU",
+              "Product Name",
+              "Price (CAD)",
+              "Line/Category",
+              "Availability",
+              "Product URL",
+              "Price Type",
+              "Updated UTC",
+          }
+          if not rows or not required.issubset(rows[0]):
+              raise SystemExit("CSV headers are missing required columns")
+
+          for row in rows:
+              if Decimal(row["Price (CAD)"]) <= 0:
+                  raise SystemExit(f"Invalid price for {row['SKU']}")
 
           print(f"Validated {len(rows)} CSV rows")
           PY
@@ -61,7 +76,7 @@ jobs:
       - name: Commit updated data
         run: |
           if git diff --quiet -- unifi_prices.csv; then
-            echo "No price changes to commit."
+            echo "No dataset changes to commit."
             exit 0
           fi
 
