@@ -62,6 +62,13 @@ CATEGORY_ROUTES: dict[str, tuple[str, ...]] = {
     "Network Storage": ("category/network-storage",),
 }
 
+# Advanced Hosting is a storefront landing page rather than a unique hardware
+# catalog. Its hardware cards substantially overlap Cloud Gateways/Integrations,
+# and its JSON layout has changed independently of the normal category pages.
+# A failure here is logged but should not block an otherwise complete hardware
+# price refresh.
+OPTIONAL_CATEGORIES = {"Advanced Hosting"}
+
 CSV_FIELDS = [
     "SKU",
     "Product Name",
@@ -168,18 +175,59 @@ def category_json_url(store_origin: str, build_id: str, route: str) -> str:
     return f"{store_origin}/_next/data/{build_id}/{REGION_PATH}/{route}.json"
 
 
-def iter_products_from_page_props(page_props: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    """Yield products from both known category JSON layouts."""
-    for subcategory in page_props.get("subCategories", []) or []:
-        if not isinstance(subcategory, dict):
-            continue
-        for product in subcategory.get("products", []) or []:
-            if isinstance(product, dict):
-                yield product
+def looks_like_product(obj: dict[str, Any]) -> bool:
+    """Return True for storefront objects that look like product cards.
 
-    for product in page_props.get("products", []) or []:
-        if isinstance(product, dict):
-            yield product
+    Most category pages expose products under pageProps.subCategories[].products,
+    but some landing pages (notably Advanced Hosting) nest product cards deeper in
+    sections/collections. Requiring a slug plus product-ish fields avoids treating
+    arbitrary nested metadata as a product.
+    """
+    slug = str(obj.get("slug") or "").strip()
+    if not slug:
+        return False
+
+    return any(
+        key in obj
+        for key in (
+            "variants",
+            "displayPrice",
+            "price",
+            "title",
+            "name",
+            "displayName",
+            "productName",
+        )
+    )
+
+
+def iter_products_from_page_props(page_props: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    """Recursively yield product objects from a category's pageProps.
+
+    UniFi does not use one stable nesting shape for every category page. Walking
+    pageProps recursively keeps the scraper independent of presentation sections
+    while still limiting discovery to product-like dictionaries. Duplicate slugs
+    are removed later by fetch_catalog().
+    """
+    stack: list[Any] = [page_props]
+    seen_objects: set[int] = set()
+
+    while stack:
+        obj = stack.pop()
+
+        if isinstance(obj, dict):
+            object_id = id(obj)
+            if object_id in seen_objects:
+                continue
+            seen_objects.add(object_id)
+
+            if looks_like_product(obj):
+                yield obj
+
+            stack.extend(obj.values())
+
+        elif isinstance(obj, list):
+            stack.extend(obj)
 
 
 def fetch_category(
@@ -260,6 +308,16 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
                 if route_index < len(routes):
                     print(f"  route {route} returned no usable catalog; trying fallback")
                     continue
+
+                if category_label in OPTIONAL_CATEGORIES:
+                    print(
+                        f"  WARNING: optional category {category_label} could not be parsed; "
+                        "continuing because its hardware overlaps other categories"
+                    )
+                    print(f"  details: {' | '.join(route_errors)}")
+                    products = []
+                    break
+
                 raise RuntimeError(
                     f"{category_label} failed on every known route: "
                     + " | ".join(route_errors)
