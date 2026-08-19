@@ -771,6 +771,26 @@ def variant_label(variant: dict[str, Any]) -> str:
     return first_nonempty(variant, ("title", "name", "label", "displayName"))
 
 
+def normalized_product_key(value: str) -> str:
+    """Normalize a storefront slug/SKU for primary-variant matching.
+
+    Canadian storefront product slugs are product-level identifiers such as
+    ``u7-pro-max`` while the purchasable North American hardware SKU may be
+    ``U7-Pro-Max-US``.  Strip only known regional suffixes; do not strip pack
+    markers such as ``-5`` so a parent card price cannot leak onto a multipack.
+    """
+    key = value.strip().casefold().replace("_", "-")
+    for suffix in ("-us", "-ca", "-eu", "-uk"):
+        if key.endswith(suffix):
+            key = key[: -len(suffix)]
+            break
+    return key
+
+
+def is_primary_variant_sku(sku: str, slug: str) -> bool:
+    return bool(sku and slug) and normalized_product_key(sku) == normalized_product_key(slug)
+
+
 def product_url(slug: str) -> str:
     return f"{DISPLAY_BASE}/{REGION_PATH}/products/{slug}"
 
@@ -829,15 +849,16 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
         ]
 
     # If multiple variants expose distinct real SKUs, keep one row per SKU.
-    # A single category card cannot safely describe differently priced variants,
-    # so we apply its split price only when the card is Exact and all JSON
-    # variants currently agree on the same quote price.
+    # The category card is authoritative for the *primary* hardware variant
+    # when it shows an Exact price.  This covers regional SKU decoration such
+    # as U7-Pro-Max-US -> u7-pro-max and normal switch SKUs whose model matches
+    # the product slug.  We still avoid applying that price to packs/bundles or
+    # other genuinely different variants.
+    #
+    # If every JSON variant already agrees on price, the Exact card can safely
+    # be applied to every row as before.
     distinct_json_prices = {item[1] for item in priced_variants}
-    safe_exact_overlay = (
-        visible_price is not None
-        and visible_price.price_type == "Exact"
-        and len(distinct_json_prices) == 1
-    )
+    all_variants_share_price = len(distinct_json_prices) == 1
 
     distinct_variant_rows: list[CatalogRow] = []
     seen_variant_skus: set[str] = set()
@@ -856,14 +877,20 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
         if len(priced_variants) > 1 and label and label.lower() not in base_name.lower():
             name = f"{base_name} - {label}"
 
-        if safe_exact_overlay and visible_price is not None:
+        use_exact_overlay = (
+            visible_price is not None
+            and visible_price.price_type == "Exact"
+            and (all_variants_share_price or is_primary_variant_sku(sku, slug))
+        )
+
+        if use_exact_overlay and visible_price is not None:
             base_price = visible_price.base_price_cad
             surcharge_price = visible_price.surcharge_price_cad
             quote_price = visible_price.quote_price_cad
         else:
             # JSON remains authoritative for variant-specific quote pricing. Do
             # not invent a base/surcharge split when the category card only says
-            # "From" or variants have genuinely different prices.
+            # "From" or this is a pack/bundle/other non-primary variant.
             base_price = json_price
             surcharge_price = None
             quote_price = json_price
