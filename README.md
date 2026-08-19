@@ -1,13 +1,13 @@
-# Automated UniFi Canada Price Dataset
+Automated UniFi Canada Price Dataset
 
-This repository maintains an Excel-friendly CSV containing current hardware pricing from the official Canadian Ubiquiti UniFi Store.
+This repository maintains an Excel-friendly CSV of current Canadian UniFi Store pricing.
 
-The intended data flow is:
+The data flow is intentionally simple:
 
 ```text
-Canadian UniFi Store
+UniFi Store Next.js category JSON
         ↓
-Playwright scraper
+Python + requests
         ↓
 unifi_prices.csv
         ↓
@@ -16,26 +16,38 @@ GitHub raw file
 Excel / Power Query
 ```
 
+## Why this version is lightweight
+
+The scraper does **not** open hundreds of product pages in Chromium.
+
+A run normally performs:
+
+- 1 request to the Canadian storefront homepage to discover the current Next.js `buildId`;
+- 9 category JSON requests covering the UniFi catalog;
+- at most one extra homepage/category request if the `buildId` rotates during the run.
+
+The scheduled workflow runs once per day.
+
 ## Output
 
-The scraper writes `unifi_prices.csv` with these columns:
+`unifi_prices.csv` contains:
 
 | Column | Purpose |
-|---|---|
-| `SKU` | UniFi model/SKU used as the lookup key in Excel |
-| `Product Name` | Store product name |
-| `Price (CAD)` | Current displayed Canadian price |
-| `Line/Category` | High-level UniFi product category |
-| `Availability` | In Stock, Out of Stock, Preorder, Selectable, or Unknown |
-| `Product URL` | Source product page |
+| --- | --- |
+| `SKU` | UniFi SKU/model when exposed by the catalog; otherwise the stable product slug |
+| `Product Name` | Store product/variant name |
+| `Price (CAD)` | Current Canadian display price |
+| `Line/Category` | High-level UniFi category |
+| `Availability` | In Stock, Out of Stock, Coming Soon, Preorder, or Unknown |
+| `Product URL` | Canadian store product page |
 | `Price Type` | `Exact` or `From` |
-| `Updated UTC` | Timestamp of the successful scrape |
+| `Updated UTC` | Timestamp of the successful fetch |
 
-The original first five columns are retained so existing Excel/Power Query mappings can continue to use them.
+The original first five columns remain first for compatibility with the Excel/Power Query design.
 
 ## Excel / Power Query URL
 
-Use the raw GitHub CSV URL:
+Use:
 
 ```text
 https://raw.githubusercontent.com/IDG-Donald/unifi-price-check/main/unifi_prices.csv
@@ -69,99 +81,93 @@ in
     Types
 ```
 
-In Excel, load the query as a table and use `SKU` as the stable lookup key from estimating/quotation sheets.
-
-## How the scraper works
+## How the fetch works
 
 `get_unifi_prices.py`:
 
-1. Opens the major Canadian UniFi Store category pages in Chromium using Playwright.
-2. Discovers product and product-collection links from the rendered store.
-3. Expands collection pages to discover additional individual products.
-4. Visits each product page.
-5. Prefers structured JSON-LD/meta product data and falls back to visible page text when required.
-6. Deduplicates products by SKU.
-7. Validates the result before publishing it.
-8. Replaces `unifi_prices.csv` atomically only after validation succeeds.
+1. Fetches the Canadian store homepage and extracts the current Next.js `buildId`.
+2. Requests the JSON backing nine broad UniFi category pages.
+3. Reads products from `pageProps.subCategories[].products`, with a flat `pageProps.products` fallback.
+4. Deduplicates products by their store slug.
+5. Reads prices from variant `displayPrice`, falling back to `price`.
+6. Reads availability from variant `status`.
+7. Emits separate rows for distinct priced variants when the store provides distinct variant SKUs; otherwise it emits one product row using the lowest displayed price and marks it `From` when appropriate.
+8. Validates the full dataset.
+9. Atomically replaces `unifi_prices.csv` only after validation succeeds.
 
-A scraping failure exits with a non-zero status. It does **not** deliberately overwrite the previous good CSV with an `ERROR` row.
+The current endpoint pattern and JSON structure are based on the public storefront behavior also used by the open-source `jamesccupps/UnifiStockWatcher` project.
 
-## GitHub Actions
+## Failure behavior
 
-`.github/workflows/unifi-tracker.yml` runs every day at 06:00 UTC and can also be started manually from the Actions tab.
+The previous good CSV is preserved if the fetch fails.
 
-On a successful scrape it commits `unifi_prices.csv` only when the file changed.
+The script refuses to publish when, for example:
+
+- too few unique products are returned;
+- none of several known UniFi product slugs are present;
+- too few catalog products have usable prices;
+- a broad category returns no products;
+- a price is non-positive;
+- the storefront stops returning the expected Next.js JSON shape.
+
+A failed run exits non-zero so GitHub Actions shows the problem instead of committing an `ERROR` row.
 
 ## Local test
 
 Python 3.12 is recommended.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install chromium
-python get_unifi_prices.py
-```
-
-On Windows PowerShell:
+### Windows PowerShell
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m playwright install chromium
 python get_unifi_prices.py
 ```
 
-For troubleshooting with a visible browser:
+### Linux / macOS
 
-```powershell
-$env:UNIFI_HEADLESS="0"
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 python get_unifi_prices.py
 ```
 
-## If GitHub-hosted runners are blocked
+A healthy run should show roughly this pattern:
 
-Ubiquiti may challenge or block traffic from cloud/datacenter IP ranges. If the workflow consistently receives an anti-bot page while the script works from your own network, use a GitHub self-hosted runner.
-
-Change:
-
-```yaml
-runs-on: ubuntu-latest
+```text
+Store buildId: ...
+Fetching category 1/9: Cloud Gateways
+  received ... product records; ... new unique slugs
+...
+Fetched ... unique products from 9 category requests
+Success: wrote ... rows to unifi_prices.csv
 ```
 
-to:
-
-```yaml
-runs-on: [self-hosted, linux, x64]
-```
-
-The rest of the workflow can remain the same.
-
-## Safety / failure behavior
-
-The scraper deliberately refuses to publish obviously bad datasets. Current checks include:
-
-- minimum product count;
-- minimum successful parse ratio;
-- presence of at least one known UniFi SKU;
-- excessive duplicate-SKU detection;
-- positive product prices.
-
-If UniFi changes its site structure, the workflow should fail visibly while leaving the last successfully generated CSV in place.
+It should finish vastly faster than the browser-based version because it is no longer loading every product page.
 
 ## Configuration
 
 Optional environment variables:
 
 | Variable | Default | Purpose |
-|---|---:|---|
-| `UNIFI_OUTPUT_FILE` | `unifi_prices.csv` | Output path |
-| `UNIFI_MIN_PRODUCTS` | `40` | Minimum valid rows required |
-| `UNIFI_HEADLESS` | `1` | Set to `0` for a visible browser |
-| `UNIFI_NAV_TIMEOUT_MS` | `60000` | Navigation timeout per page |
+| --- | --- | --- |
+| `UNIFI_OUTPUT_FILE` | `unifi_prices.csv` | Output CSV path |
+| `UNIFI_MIN_PRODUCTS` | `100` | Minimum unique catalog products required |
+| `UNIFI_MIN_PRICED_RATIO` | `0.70` | Minimum fraction of catalog products that must yield a price |
+| `UNIFI_REQUEST_TIMEOUT` | `20` | HTTP timeout in seconds |
+| `UNIFI_CATEGORY_DELAY` | `0.25` | Delay between category calls |
+| `UNIFI_STORE_BASE` | `https://store.ui.com` | Host used for the storefront JSON endpoints |
+| `UNIFI_DISPLAY_BASE` | `https://ca.store.ui.com` | Host used in generated product links |
+| `UNIFI_REGION_PATH` | `ca/en` | Store locale/region path |
 
-## Important note
+## GitHub Actions
 
-This project depends on the current public presentation of the Ubiquiti Store. It does not use a documented public Ubiquiti retail-pricing API. Site changes or anti-bot controls can therefore require maintenance.
+`.github/workflows/unifi-tracker.yml` runs once daily at 06:00 UTC and can also be run manually.
+
+Because `Updated UTC` records each successful refresh, a normal successful daily run will produce a fresh CSV commit even when prices themselves did not change.
+
+## Notes
+
+This project relies on an undocumented public storefront data shape, not a documented retail-pricing API. Ubiquiti can change the Next.js routes or JSON schema, so validation is deliberately strict enough to fail visibly rather than silently publishing a bad price list.
