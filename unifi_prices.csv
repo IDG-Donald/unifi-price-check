@@ -1,2 +1,2 @@
 SKU,Product Name,Price (CAD),Line/Category,Availability
-ERROR,Failed to reach bypass database feed,0.00,System,Offline
+ERROR,Data mirror is currently offline or unreachable,0.00,System,Offline
