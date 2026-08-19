@@ -1,4 +1,4 @@
-Automated UniFi Canada Price Dataset
+# Automated UniFi Canada Price Dataset
 
 This repository maintains an Excel-friendly CSV of current Canadian UniFi Store pricing.
 
@@ -33,7 +33,7 @@ The scheduled workflow runs once per day.
 `unifi_prices.csv` contains:
 
 | Column | Purpose |
-| --- | --- |
+|---|---|
 | `SKU` | UniFi SKU/model when exposed by the catalog; otherwise the stable product slug |
 | `Product Name` | Store product/variant name |
 | `Price (CAD)` | Current Canadian display price |
@@ -85,7 +85,7 @@ in
 
 `get_unifi_prices.py`:
 
-1. Fetches the Canadian store homepage and extracts the current Next.js `buildId`.
+1. Fetches `https://ca.store.ui.com/ca/en`, extracts the current Next.js `buildId`, and records the effective storefront origin.
 2. Requests the JSON backing nine broad UniFi category pages.
 3. Reads products from `pageProps.subCategories[].products`, with a flat `pageProps.products` fallback.
 4. Deduplicates products by their store slug.
@@ -152,13 +152,13 @@ It should finish vastly faster than the browser-based version because it is no l
 Optional environment variables:
 
 | Variable | Default | Purpose |
-| --- | --- | --- |
+|---|---:|---|
 | `UNIFI_OUTPUT_FILE` | `unifi_prices.csv` | Output CSV path |
 | `UNIFI_MIN_PRODUCTS` | `100` | Minimum unique catalog products required |
 | `UNIFI_MIN_PRICED_RATIO` | `0.70` | Minimum fraction of catalog products that must yield a price |
 | `UNIFI_REQUEST_TIMEOUT` | `20` | HTTP timeout in seconds |
 | `UNIFI_CATEGORY_DELAY` | `0.25` | Delay between category calls |
-| `UNIFI_STORE_BASE` | `https://store.ui.com` | Host used for the storefront JSON endpoints |
+| `UNIFI_STORE_ENTRY` | `https://ca.store.ui.com` | Canadian storefront used to discover the build ID and effective JSON host |
 | `UNIFI_DISPLAY_BASE` | `https://ca.store.ui.com` | Host used in generated product links |
 | `UNIFI_REGION_PATH` | `ca/en` | Store locale/region path |
 

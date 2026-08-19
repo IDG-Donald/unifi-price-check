@@ -21,14 +21,17 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# The JSON endpoints observed on the public storefront are served from
-# store.ui.com. Product links are presented on the Canadian storefront host.
-STORE_BASE = os.getenv("UNIFI_STORE_BASE", "https://store.ui.com").rstrip("/")
+# Start from the Canadian storefront directly. UniFi currently redirects
+# store.ui.com/ca/en to ca.store.ui.com; keeping the JSON requests on the
+# effective storefront origin avoids receiving an HTML storefront/redirect page
+# where Next.js JSON is expected.
+STORE_ENTRY = os.getenv("UNIFI_STORE_ENTRY", "https://ca.store.ui.com").rstrip("/")
 DISPLAY_BASE = os.getenv("UNIFI_DISPLAY_BASE", "https://ca.store.ui.com").rstrip("/")
 REGION_PATH = os.getenv("UNIFI_REGION_PATH", "ca/en").strip("/")
 OUTPUT_FILE = Path(os.getenv("UNIFI_OUTPUT_FILE", "unifi_prices.csv"))
@@ -128,9 +131,21 @@ def make_session() -> requests.Session:
     return session
 
 
-def get_build_id(session: requests.Session) -> str:
-    """Read the current Next.js build ID from the Canadian store homepage."""
-    url = f"{STORE_BASE}/{REGION_PATH}"
+def origin_from_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(f"Could not determine storefront origin from URL: {url}")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def get_store_context(session: requests.Session) -> tuple[str, str]:
+    """Return (build_id, effective_store_origin) for the Canadian storefront.
+
+    requests follows redirects automatically. The important detail is to build
+    the /_next/data URL on the host that actually served the homepage, not on
+    the pre-redirect hostname.
+    """
+    url = f"{STORE_ENTRY}/{REGION_PATH}"
     response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
 
@@ -138,11 +153,11 @@ def get_build_id(session: requests.Session) -> str:
     if not match:
         raise RuntimeError("Could not find the UniFi Store Next.js buildId")
 
-    return match.group(1)
+    return match.group(1), origin_from_url(response.url)
 
 
-def category_json_url(build_id: str, route: str) -> str:
-    return f"{STORE_BASE}/_next/data/{build_id}/{REGION_PATH}/{route}.json"
+def category_json_url(store_origin: str, build_id: str, route: str) -> str:
+    return f"{store_origin}/_next/data/{build_id}/{REGION_PATH}/{route}.json"
 
 
 def iter_products_from_page_props(page_props: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -161,27 +176,36 @@ def iter_products_from_page_props(page_props: dict[str, Any]) -> Iterable[dict[s
 
 def fetch_category(
     session: requests.Session,
+    store_origin: str,
     build_id: str,
     category_label: str,
     route: str,
-) -> tuple[list[dict[str, Any]], str]:
-    """Fetch one category, refreshing buildId once if it rotated mid-run."""
+) -> tuple[list[dict[str, Any]], str, str]:
+    """Fetch one category, refreshing storefront context once if needed."""
     current_build = build_id
+    current_origin = store_origin
 
     for attempt in range(2):
-        url = category_json_url(current_build, route)
+        url = category_json_url(current_origin, current_build, route)
         response = session.get(url, timeout=REQUEST_TIMEOUT)
 
         if response.status_code == 404 and attempt == 0:
             print(f"  {category_label}: buildId may have rotated; refreshing once")
-            current_build = get_build_id(session)
+            current_build, current_origin = get_store_context(session)
             continue
 
         response.raise_for_status()
+
+        content_type = response.headers.get("content-type", "")
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RuntimeError(f"{category_label} did not return JSON") from exc
+            snippet = " ".join(response.text[:220].split())
+            raise RuntimeError(
+                f"{category_label} did not return JSON "
+                f"(status={response.status_code}, content-type={content_type!r}, "
+                f"requested={url}, final={response.url}, body={snippet!r})"
+            ) from exc
 
         page_props = payload.get("pageProps")
         if not isinstance(page_props, dict):
@@ -191,22 +215,24 @@ def fetch_category(
         if not products:
             raise RuntimeError(f"{category_label} returned zero products")
 
-        return products, current_build
+        return products, current_build, current_origin
 
     raise RuntimeError(f"Could not fetch {category_label}")
 
 
 def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
     """Fetch all categories and deduplicate products by store slug."""
-    build_id = get_build_id(session)
+    build_id, store_origin = get_store_context(session)
+    print(f"Store origin: {store_origin}")
     print(f"Store buildId: {build_id}")
 
     by_slug: dict[str, dict[str, Any]] = {}
 
     for index, (category_label, route) in enumerate(CATEGORIES.items(), start=1):
         print(f"Fetching category {index}/{len(CATEGORIES)}: {category_label}")
-        products, build_id = fetch_category(
+        products, build_id, store_origin = fetch_category(
             session=session,
+            store_origin=store_origin,
             build_id=build_id,
             category_label=category_label,
             route=route,
