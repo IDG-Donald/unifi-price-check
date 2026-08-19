@@ -11,6 +11,7 @@ temporary file, validated, and only then atomically replaces the previous CSV.
 from __future__ import annotations
 
 import csv
+import html
 import os
 import re
 import sys
@@ -72,7 +73,11 @@ OPTIONAL_CATEGORIES = {"Advanced Hosting"}
 CSV_FIELDS = [
     "SKU",
     "Product Name",
+    "Store Description",
+    # Backward-compatible quote price. This remains the price Excel should use.
     "Price (CAD)",
+    "Base Price (CAD)",
+    "Surcharge Price (CAD)",
     "Line/Category",
     "Availability",
     "Product URL",
@@ -92,13 +97,43 @@ KNOWN_PRODUCT_SLUGS = {
 BUILD_ID_RE = re.compile(r'"buildId":"([^"\\]+)"')
 PRICE_TEXT_RE = re.compile(r"-?[0-9]+(?:[.,][0-9]+)?")
 SKUISH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+/-]{1,63}$")
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WHITESPACE_RE = re.compile(r"\s+")
+
+# UniFi's category payloads have used several description-ish keys over time.
+# Prefer the short customer-readable summary shown on category/product cards.
+DESCRIPTION_KEYS = (
+    "description",
+    "shortDescription",
+    "short_description",
+    "productDescription",
+    "summary",
+    "subtitle",
+    "tagline",
+)
+
+# In the current storefront payload, `price` is the underlying/raw price while
+# `displayPrice` is the price presented to the shopper. During the Canadian
+# memory-surcharge period these can differ. Extra aliases are included so this
+# survives small API naming changes without silently losing the final price.
+BASE_PRICE_KEYS = ("basePrice", "priceBeforeSurcharge", "price")
+DISPLAY_PRICE_KEYS = (
+    "surchargePrice",
+    "priceWithSurcharge",
+    "displayPrice",
+    "finalPrice",
+    "currentPrice",
+)
 
 
 @dataclass(frozen=True)
 class CatalogRow:
     sku: str
     product_name: str
+    store_description: str
     price_cad: Decimal
+    base_price_cad: Decimal
+    surcharge_price_cad: Decimal | None
     category: str
     availability: str
     product_url: str
@@ -109,7 +144,14 @@ class CatalogRow:
         return {
             "SKU": self.sku,
             "Product Name": self.product_name,
+            "Store Description": self.store_description,
             "Price (CAD)": f"{self.price_cad:.2f}",
+            "Base Price (CAD)": f"{self.base_price_cad:.2f}",
+            "Surcharge Price (CAD)": (
+                f"{self.surcharge_price_cad:.2f}"
+                if self.surcharge_price_cad is not None
+                else ""
+            ),
             "Line/Category": self.category,
             "Availability": self.availability,
             "Product URL": self.product_url,
@@ -398,10 +440,81 @@ def money_to_decimal(value: Any) -> Decimal | None:
     return None
 
 
-def variant_price(variant: dict[str, Any]) -> Decimal | None:
-    # displayPrice is intentionally preferred because it is the storefront's
-    # presentation price; fall back to the raw price field when necessary.
-    return money_to_decimal(variant.get("displayPrice")) or money_to_decimal(variant.get("price"))
+def first_money(mapping: dict[str, Any], keys: Iterable[str]) -> Decimal | None:
+    for key in keys:
+        value = money_to_decimal(mapping.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def price_components(mapping: dict[str, Any]) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """Return (base_price, surcharge/display_price, quote_price).
+
+    `quote_price` is the customer-facing current store price: display/surcharge
+    price when present, otherwise base price. Keeping these components separate
+    lets Excel use the final price while still retaining the underlying price.
+    """
+    base_price = first_money(mapping, BASE_PRICE_KEYS)
+    surcharge_price = first_money(mapping, DISPLAY_PRICE_KEYS)
+    quote_price = surcharge_price or base_price
+
+    # Some payload shapes expose only displayPrice. Preserve a usable base value
+    # rather than leaving Base Price blank; Surcharge Price remains explicit.
+    if base_price is None and quote_price is not None:
+        base_price = quote_price
+
+    return base_price, surcharge_price, quote_price
+
+
+def clean_description_text(value: Any) -> str:
+    """Convert simple storefront description payloads to one-line plain text."""
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        text = html.unescape(HTML_TAG_RE.sub(" ", value))
+        return WHITESPACE_RE.sub(" ", text).strip()
+
+    # Rich-text payloads commonly keep readable text under one of these keys.
+    if isinstance(value, dict):
+        for key in ("text", "value", "content", "plainText"):
+            if key in value:
+                text = clean_description_text(value.get(key))
+                if text:
+                    return text
+        return ""
+
+    if isinstance(value, list):
+        parts = [clean_description_text(item) for item in value]
+        return " ".join(part for part in parts if part).strip()
+
+    return ""
+
+
+def product_description(product: dict[str, Any]) -> str:
+    # Fast path: most category cards keep the description directly on product.
+    for key in DESCRIPTION_KEYS:
+        text = clean_description_text(product.get(key))
+        if text:
+            return text
+
+    # Some category layouts wrap card copy in a nested presentation object. Walk
+    # only for known description keys rather than grabbing arbitrary text fields.
+    stack: list[Any] = list(product.values())
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, dict):
+            for key in DESCRIPTION_KEYS:
+                if key in obj:
+                    text = clean_description_text(obj.get(key))
+                    if text:
+                        return text
+            stack.extend(obj.values())
+        elif isinstance(obj, list):
+            stack.extend(obj)
+
+    return ""
 
 
 def normalize_status(value: Any) -> str:
@@ -486,15 +599,21 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
 
     category = str(product.get("_category") or "Unknown")
     base_name = product_name(product, slug)
+    description = product_description(product)
     variants = [v for v in (product.get("variants") or []) if isinstance(v, dict)]
 
-    priced_variants = [(variant, variant_price(variant)) for variant in variants]
-    priced_variants = [(variant, price) for variant, price in priced_variants if price is not None and price > 0]
+    priced_variants: list[tuple[dict[str, Any], Decimal, Decimal | None, Decimal]] = []
+    for variant in variants:
+        base_price, surcharge_price, quote_price = price_components(variant)
+        if quote_price is None or quote_price <= 0 or base_price is None or base_price <= 0:
+            continue
+        priced_variants.append((variant, base_price, surcharge_price, quote_price))
 
     if not priced_variants:
-        # A few storefront product objects may carry a direct price instead.
-        direct_price = money_to_decimal(product.get("displayPrice")) or money_to_decimal(product.get("price"))
-        if direct_price is None or direct_price <= 0:
+        # A few storefront product objects carry the price directly rather than
+        # under variants. Use the same base/display semantics.
+        base_price, surcharge_price, quote_price = price_components(product)
+        if quote_price is None or quote_price <= 0 or base_price is None or base_price <= 0:
             return []
 
         sku, _is_real_sku = extract_sku(product, None, slug)
@@ -502,7 +621,10 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
             CatalogRow(
                 sku=sku,
                 product_name=base_name,
-                price_cad=direct_price,
+                store_description=description,
+                price_cad=quote_price,
+                base_price_cad=base_price,
+                surcharge_price_cad=surcharge_price,
                 category=category,
                 availability=aggregate_status(variants) if variants else "Unknown",
                 product_url=product_url(slug),
@@ -516,7 +638,7 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
     seen_variant_skus: set[str] = set()
     real_variant_sku_count = 0
 
-    for variant, price in priced_variants:
+    for variant, base_price, surcharge_price, quote_price in priced_variants:
         sku, is_real_sku = extract_sku(product, variant, slug)
         if is_real_sku:
             real_variant_sku_count += 1
@@ -533,7 +655,10 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
             CatalogRow(
                 sku=sku,
                 product_name=name,
-                price_cad=price,
+                store_description=description,
+                price_cad=quote_price,
+                base_price_cad=base_price,
+                surcharge_price_cad=surcharge_price,
                 category=category,
                 availability=normalize_status(variant.get("status")),
                 product_url=product_url(slug),
@@ -545,17 +670,24 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
     if real_variant_sku_count == len(priced_variants):
         return distinct_variant_rows
 
-    # Otherwise, expose one product row using the lowest displayed variant
-    # price. This mirrors category cards that present a "From" price.
-    lowest_price = min(price for _variant, price in priced_variants)
+    # Otherwise expose one product row using the variant with the lowest final
+    # displayed price. Keeping all price components from that same variant avoids
+    # accidentally pairing the base price of one configuration with the display
+    # price of another.
+    _variant, base_price, surcharge_price, quote_price = min(
+        priced_variants, key=lambda item: item[3]
+    )
     sku, _is_real_sku = extract_sku(product, None, slug)
-    distinct_prices = {price for _variant, price in priced_variants}
+    distinct_prices = {item[3] for item in priced_variants}
 
     return [
         CatalogRow(
             sku=sku,
             product_name=base_name,
-            price_cad=lowest_price,
+            store_description=description,
+            price_cad=quote_price,
+            base_price_cad=base_price,
+            surcharge_price_cad=surcharge_price,
             category=category,
             availability=aggregate_status(variants),
             product_url=product_url(slug),
@@ -596,7 +728,10 @@ def validate_catalog(products: dict[str, dict[str, Any]], rows: list[CatalogRow]
             )
 
     if any(row.price_cad <= 0 for row in rows):
-        errors.append("one or more output prices are not positive")
+        errors.append("one or more output quote prices are not positive")
+
+    if any(row.base_price_cad <= 0 for row in rows):
+        errors.append("one or more output base prices are not positive")
 
     if errors:
         raise RuntimeError("Dataset validation failed: " + "; ".join(errors))
@@ -649,9 +784,19 @@ def run() -> None:
     atomic_write_csv(rows, OUTPUT_FILE)
 
     real_sku_like = sum(1 for row in rows if row.sku != row.product_url.rsplit("/", 1)[-1])
+    surcharge_rows = sum(
+        1
+        for row in rows
+        if row.surcharge_price_cad is not None
+        and row.surcharge_price_cad != row.base_price_cad
+    )
+    descriptions = sum(1 for row in rows if row.store_description)
+
     print(f"Success: wrote {len(rows)} rows to {OUTPUT_FILE}")
     print(f"Products without a usable price: {len(unpriced_slugs)}")
     print(f"Rows with a model/SKU instead of slug fallback: {real_sku_like}/{len(rows)}")
+    print(f"Rows with a separate base/display price: {surcharge_rows}/{len(rows)}")
+    print(f"Rows with a store description: {descriptions}/{len(rows)}")
 
     if unpriced_slugs:
         preview = ", ".join(sorted(unpriced_slugs)[:12])
