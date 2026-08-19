@@ -2,38 +2,71 @@ name: Update UniFi Prices
 
 on:
   schedule:
-    # Runs automatically every day at 6:00 AM UTC
-    - cron: '0 6 * * *'
-  workflow_dispatch: # Allows you to manually trigger it via the Actions tab
+    # Daily at 06:00 UTC.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write # Grants the workflow permission to save data to your repo
+  contents: write
+
+concurrency:
+  group: unifi-price-refresh
+  cancel-in-progress: false
 
 jobs:
   scrape-and-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Check out repository code
-        uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v6
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Install Dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
 
-      - name: Run Price Tracker Script
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Scrape Canadian UniFi Store
+        env:
+          UNIFI_MIN_PRODUCTS: "40"
         run: python get_unifi_prices.py
 
-      - name: Commit and Push Updated Data
+      - name: Verify generated CSV exists
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          test -s unifi_prices.csv
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          path = Path("unifi_prices.csv")
+          with path.open(newline="", encoding="utf-8") as f:
+              rows = list(csv.DictReader(f))
+
+          if len(rows) < 40:
+              raise SystemExit(f"Refusing to publish only {len(rows)} rows")
+
+          print(f"Validated {len(rows)} CSV rows")
+          PY
+
+      - name: Commit updated data
+        run: |
+          if git diff --quiet -- unifi_prices.csv; then
+            echo "No price changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add unifi_prices.csv
-          # The conditional check prevents workflow errors if prices didn't change
-          git diff-index --quiet HEAD || (git commit -m "Automated price refresh: $(date -u)" && git push)
+          git commit -m "Automated UniFi price refresh"
+          git push
