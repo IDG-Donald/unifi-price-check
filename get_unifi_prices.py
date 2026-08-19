@@ -4,7 +4,7 @@
 This version uses the public JSON payloads that back the UniFi Store's Next.js
 category pages for product discovery, then fetches one normal HTML category page
 per logical category to capture the displayed base / "Surcharge incl." price pair.
-It does not launch a browser or request every product page.
+It does not launch a browser and never crawls individual product pages.
 
 Failure behavior is intentionally conservative: a new CSV is written to a
 temporary file, validated, and only then atomically replaces the previous CSV.
@@ -73,21 +73,8 @@ CATEGORY_ROUTES: dict[str, tuple[str, ...]] = {
 # price refresh.
 OPTIONAL_CATEGORIES = {"Advanced Hosting"}
 
-# Category pages often render only the final surcharge-inclusive amount.
-# Individual product pages reliably expose the explicit base + "Surcharge incl."
-# pair. We therefore use product pages only when the category overlay did not
-# provide a split, and reuse yesterday's verified split whenever the quote
-# price is unchanged. This keeps normal daily request volume low.
-PRODUCT_PAGE_DELAY_SECONDS = 0.15
-PRODUCT_PAGE_ENRICH_CATEGORIES = {
-    "Cloud Gateways",
-    "Switching",
-    "WiFi",
-    "Physical Security",
-    "Door Access",
-    "Integrations",
-    "Network Storage",
-}
+# Category HTML is the authoritative source for the visible Canadian
+# base / "Surcharge incl." price pair. One HTML request per category is enough.
 
 
 CSV_FIELDS = [
@@ -146,8 +133,8 @@ DESCRIPTION_KEYS = (
 # discovery, SKU, stock, description, and a usable current price. It does NOT
 # reliably expose the Canadian memory surcharge as a separate field.
 #
-# The true base/surcharge pair is therefore parsed from the rendered category
-# HTML, where UniFi explicitly displays e.g. "$400.00 $431.00 Surcharge incl.".
+# The true base/surcharge pair is parsed from category HTML, where UniFi
+# explicitly displays e.g. "$400.00 $431.00 Surcharge incl.".
 JSON_PRICE_KEYS = (
     "displayPrice",
     "price",
@@ -316,36 +303,42 @@ def parse_storefront_price_text(text: str) -> StorefrontPrice | None:
 
 
 def nearest_product_card_price(anchor: Any) -> StorefrontPrice | None:
-    """Walk upward from a product link until a compact price-bearing card is found."""
+    """Read the price from a product-card link, then cautiously walk upward.
+
+    On the current store each product card is itself an <a> element, so parsing
+    the anchor before its parents prevents a neighbouring card's price from
+    being borrowed from a shared grid/container ancestor.
+    """
     node = anchor
     for _ in range(10):
-        node = getattr(node, "parent", None)
         if node is None:
             break
 
-        # Category cards are compact. Refuse very large ancestors so a match
-        # cannot accidentally borrow a neighbouring product's price.
         text = " ".join(node.stripped_strings)
-        if not text or len(text) > 5000:
-            continue
+        if text and len(text) <= 5000:
+            parsed = parse_storefront_price_text(text)
+            if parsed is not None:
+                return parsed
 
-        parsed = parse_storefront_price_text(text)
-        if parsed is not None:
-            return parsed
+        node = getattr(node, "parent", None)
 
     return None
 
 
-def parse_category_html_prices(
-    html_text: str, known_slugs: set[str]
-) -> dict[str, StorefrontPrice]:
-    """Return displayed base/surcharge prices keyed by product slug."""
+def parse_category_html_prices(html_text: str) -> dict[str, StorefrontPrice]:
+    """Return displayed base/surcharge prices keyed by parent product slug.
+
+    Parse the HTML independently from the JSON catalog.  The category cards use
+    parent-product hrefs such as /products/u7-pro-max while the JSON may expose
+    regional hardware SKUs such as U7-Pro-Max-US.  Filtering HTML links against
+    JSON slugs before parsing caused valid WiFi/Switching cards to be discarded.
+    """
     soup = BeautifulSoup(html_text, "html.parser")
     prices: dict[str, StorefrontPrice] = {}
 
     for anchor in soup.find_all("a", href=True):
         slug = slug_from_product_href(str(anchor.get("href") or ""))
-        if not slug or slug not in known_slugs or slug in prices:
+        if not slug or slug in prices:
             continue
 
         parsed = nearest_product_card_price(anchor)
@@ -359,14 +352,8 @@ def fetch_category_html_prices(
     session: requests.Session,
     store_origin: str,
     route: str,
-    products: list[dict[str, Any]],
 ) -> dict[str, StorefrontPrice]:
-    """Fetch one rendered category HTML page and parse visible price pairs."""
-    known_slugs = {str(p.get("slug") or "").strip() for p in products}
-    known_slugs.discard("")
-    if not known_slugs:
-        return {}
-
+    """Fetch one category HTML page and parse visible price pairs."""
     url = category_page_url(store_origin, route)
     response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
@@ -378,273 +365,47 @@ def fetch_category_html_prices(
             f"(status={response.status_code}, content-type={content_type!r}, url={response.url})"
         )
 
-    return parse_category_html_prices(response.text, known_slugs)
-
-
-def fetch_product_page_surcharge_price(
-    session: requests.Session,
-    store_origin: str,
-    product_url_value: str,
-) -> tuple[StorefrontPrice | None, str]:
-    """Fetch one product page and return only an explicit surcharge pair.
-
-    Do not fall back to a generic single-price regex here: product pages contain
-    unrelated prices (free-shipping threshold, UI Care, accessories). The
-    explicit "Surcharge incl." wording uniquely identifies the pair we need.
-    The returned visible text is used to identify the selected hardware SKU.
-    """
-    response = session.get(product_url_value, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-
-    content_type = response.headers.get("content-type", "").lower()
-    if "html" not in content_type:
-        raise RuntimeError(
-            f"product page did not return HTML "
-            f"(status={response.status_code}, content-type={content_type!r}, url={response.url})"
-        )
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    visible_text = WHITESPACE_RE.sub(" ", " ".join(soup.stripped_strings)).strip()
-    pair = SURCHARGE_PAIR_RE.search(visible_text)
-    if not pair:
-        return None, visible_text
-
-    base = decimal_from_price_text(pair.group("base"))
-    surcharge = decimal_from_price_text(pair.group("surcharge"))
-    if base is None or surcharge is None or base <= 0 or surcharge <= 0:
-        return None, visible_text
-
-    return (
-        StorefrontPrice(
-            base_price_cad=base,
-            surcharge_price_cad=surcharge,
-            price_type="From" if pair.group("from") else "Exact",
-        ),
-        visible_text,
-    )
-
-
-def load_previous_rows(output_file: Path) -> dict[str, dict[str, str]]:
-    """Load prior CSV rows as a cache of verified surcharge splits."""
-    if not output_file.exists():
-        return {}
-
-    try:
-        with output_file.open("r", newline="", encoding="utf-8-sig") as handle:
-            reader = csv.DictReader(handle)
-            required = {
-                "SKU",
-                "Price (CAD)",
-                "Base Price (CAD)",
-                "Surcharge Price (CAD)",
-                "Product URL",
-            }
-            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-                return {}
-            return {
-                str(row.get("SKU") or "").casefold(): row
-                for row in reader
-                if str(row.get("SKU") or "").strip()
-            }
-    except Exception as exc:
-        print(f"WARNING: could not read previous CSV cache: {exc}")
-        return {}
-
-
-def cached_surcharge_price(
-    row: CatalogRow, previous_rows: dict[str, dict[str, str]]
-) -> StorefrontPrice | None:
-    """Reuse a prior split only when SKU, URL, and final quote price still match."""
-    old = previous_rows.get(row.sku.casefold())
-    if not old:
-        return None
-    if str(old.get("Product URL") or "").strip() != row.product_url:
-        return None
-
-    old_quote = decimal_from_price_text(str(old.get("Price (CAD)") or ""))
-    old_base = decimal_from_price_text(str(old.get("Base Price (CAD)") or ""))
-    old_surcharge = decimal_from_price_text(str(old.get("Surcharge Price (CAD)") or ""))
-    if old_quote is None or old_base is None or old_surcharge is None:
-        return None
-    if old_quote != row.price_cad or old_surcharge != row.price_cad:
-        return None
-    if old_base <= 0 or old_surcharge <= old_base:
-        return None
-
-    return StorefrontPrice(old_base, old_surcharge, "Exact")
-
-
-def slug_from_product_url(product_url_value: str) -> str:
-    path = urlsplit(product_url_value).path.rstrip("/")
-    if "/products/" not in path:
-        return ""
-    return path.rsplit("/products/", 1)[-1].split("/", 1)[0]
-
-
-def choose_product_page_target(
-    candidate_rows: list[tuple[int, CatalogRow]], visible_text: str
-) -> int | None:
-    """Choose the row represented by the product page's currently selected variant."""
-    text_folded = visible_text.casefold()
-
-    # Strongest signal: the exact hardware SKU is visible on the product page.
-    exact = [idx for idx, row in candidate_rows if row.sku.casefold() in text_folded]
-    if len(exact) == 1:
-        return exact[0]
-
-    # Common case: product slug omits a regional suffix such as -US.
-    primary = []
-    for idx, row in candidate_rows:
-        slug = slug_from_product_url(row.product_url)
-        if is_primary_variant_sku(row.sku, slug):
-            primary.append(idx)
-    if len(primary) == 1:
-        return primary[0]
-
-    # If the catalog emitted only one row for this page, it is safe to enrich it.
-    if len(candidate_rows) == 1:
-        return candidate_rows[0][0]
-
-    return None
-
-
-def enrich_surcharge_from_product_pages(
-    rows: list[CatalogRow],
-    session: requests.Session,
-    store_origin: str,
-    previous_rows: dict[str, dict[str, str]],
-) -> tuple[list[CatalogRow], dict[str, int]]:
-    """Fill missing base/surcharge pairs using cache first, product pages second."""
-    enriched = list(rows)
-    stats = {
-        "cache_hits": 0,
-        "pages_fetched": 0,
-        "page_pairs": 0,
-        "rows_enriched": 0,
-        "ambiguous_pages": 0,
-        "page_errors": 0,
-    }
-
-    # First reuse yesterday's verified split where the current quote price is unchanged.
-    for idx, row in enumerate(enriched):
-        if row.surcharge_price_cad is not None:
-            continue
-        cached = cached_surcharge_price(row, previous_rows)
-        if cached is None:
-            continue
-        enriched[idx] = replace(
-            row,
-            base_price_cad=cached.base_price_cad,
-            surcharge_price_cad=cached.surcharge_price_cad,
-            price_cad=cached.quote_price_cad,
-        )
-        stats["cache_hits"] += 1
-        stats["rows_enriched"] += 1
-
-    # Group remaining missing rows so each product page is fetched at most once.
-    by_url: dict[str, list[tuple[int, CatalogRow]]] = {}
-    for idx, row in enumerate(enriched):
-        if (
-            row.surcharge_price_cad is None
-            and row.category in PRODUCT_PAGE_ENRICH_CATEGORIES
-        ):
-            by_url.setdefault(row.product_url, []).append((idx, row))
-
-    print(
-        f"Product-page surcharge fallback: {len(by_url)} product pages may need checking "
-        f"({stats['cache_hits']} rows reused from cache)"
-    )
-
-    for page_index, (url, candidates) in enumerate(by_url.items(), start=1):
-        try:
-            price, visible_text = fetch_product_page_surcharge_price(
-                session=session,
-                store_origin=store_origin,
-                product_url_value=url,
-            )
-            stats["pages_fetched"] += 1
-            if price is None or price.surcharge_price_cad is None:
-                continue
-            stats["page_pairs"] += 1
-
-            target_idx = choose_product_page_target(candidates, visible_text)
-            if target_idx is None:
-                stats["ambiguous_pages"] += 1
-                continue
-
-            current = enriched[target_idx]
-            enriched[target_idx] = replace(
-                current,
-                base_price_cad=price.base_price_cad,
-                surcharge_price_cad=price.surcharge_price_cad,
-                price_cad=price.quote_price_cad,
-                price_type="Exact" if price.price_type == "Exact" else current.price_type,
-            )
-            stats["rows_enriched"] += 1
-        except Exception as exc:
-            stats["page_errors"] += 1
-            print(f"  WARNING: product-page pricing failed for {url}: {exc}")
-
-        if PRODUCT_PAGE_DELAY_SECONDS > 0 and page_index < len(by_url):
-            time.sleep(PRODUCT_PAGE_DELAY_SECONDS)
-
-    return enriched, stats
-
-
-def looks_like_product(obj: dict[str, Any]) -> bool:
-    """Return True for storefront objects that look like product cards.
-
-    Most category pages expose products under pageProps.subCategories[].products,
-    but some landing pages (notably Advanced Hosting) nest product cards deeper in
-    sections/collections. Requiring a slug plus product-ish fields avoids treating
-    arbitrary nested metadata as a product.
-    """
-    slug = str(obj.get("slug") or "").strip()
-    if not slug:
-        return False
-
-    return any(
-        key in obj
-        for key in (
-            "variants",
-            "displayPrice",
-            "price",
-            "title",
-            "name",
-            "displayName",
-            "productName",
-        )
-    )
+    return parse_category_html_prices(response.text)
 
 
 def iter_products_from_page_props(page_props: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    """Recursively yield product objects from a category's pageProps.
+    """Yield only top-level category product cards from the known store schema.
 
-    UniFi does not use one stable nesting shape for every category page. Walking
-    pageProps recursively keeps the scraper independent of presentation sections
-    while still limiting discovery to product-like dictionaries. Duplicate slugs
-    are removed later by fetch_catalog().
+    The storefront currently exposes catalog cards under
+    pageProps.subCategories[].products, with pageProps.products as a flat
+    fallback.  Do not recursively walk arbitrary pageProps objects: those contain
+    variants, recommendations, accessories and presentation data that can look
+    product-like and previously inflated the catalog to 1,100+ bogus entries.
     """
-    stack: list[Any] = [page_props]
-    seen_objects: set[int] = set()
+    seen_slugs: set[str] = set()
 
-    while stack:
-        obj = stack.pop()
-
-        if isinstance(obj, dict):
-            object_id = id(obj)
-            if object_id in seen_objects:
+    subcategories = page_props.get("subCategories")
+    if isinstance(subcategories, list):
+        for subcat in subcategories:
+            if not isinstance(subcat, dict):
                 continue
-            seen_objects.add(object_id)
+            products = subcat.get("products")
+            if not isinstance(products, list):
+                continue
+            for product in products:
+                if not isinstance(product, dict):
+                    continue
+                slug = str(product.get("slug") or "").strip()
+                if not slug or slug in seen_slugs:
+                    continue
+                seen_slugs.add(slug)
+                yield product
 
-            if looks_like_product(obj):
-                yield obj
-
-            stack.extend(obj.values())
-
-        elif isinstance(obj, list):
-            stack.extend(obj)
-
+    products = page_props.get("products")
+    if isinstance(products, list):
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            slug = str(product.get("slug") or "").strip()
+            if not slug or slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+            yield product
 
 def fetch_category(
     session: requests.Session,
@@ -751,7 +512,6 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
                     session=session,
                     store_origin=store_origin,
                     route=chosen_route,
-                    products=products,
                 )
                 split_count = sum(
                     1 for price in html_prices.values() if price.surcharge_price_cad is not None
@@ -1242,8 +1002,6 @@ def atomic_write_csv(rows: list[CatalogRow], output_file: Path) -> None:
 def run() -> None:
     timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     session = make_session()
-    previous_rows = load_previous_rows(OUTPUT_FILE)
-
     products = fetch_catalog(session)
 
     rows: list[CatalogRow] = []
@@ -1256,17 +1014,6 @@ def run() -> None:
             unpriced_slugs.append(slug)
 
     rows = deduplicate_rows(rows)
-
-    # Category HTML frequently contains only the final displayed price. Reuse
-    # prior verified splits first, then fetch individual product pages only for
-    # rows that still lack an explicit surcharge pair.
-    _build_id, store_origin = get_store_context(session)
-    rows, enrichment_stats = enrich_surcharge_from_product_pages(
-        rows=rows,
-        session=session,
-        store_origin=store_origin,
-        previous_rows=previous_rows,
-    )
 
     validate_catalog(products, rows)
     atomic_write_csv(rows, OUTPUT_FILE)
@@ -1287,15 +1034,6 @@ def run() -> None:
     print(f"Rows with a true base/surcharge split: {surcharge_rows}/{len(rows)}")
     print(f"Products matched to storefront HTML pricing: {html_price_products}/{len(products)}")
     print(f"Rows with a store description: {descriptions}/{len(rows)}")
-    print(
-        "Product-page surcharge fallback: "
-        f"{enrichment_stats['cache_hits']} cache hits, "
-        f"{enrichment_stats['pages_fetched']} pages fetched, "
-        f"{enrichment_stats['page_pairs']} explicit surcharge pairs found, "
-        f"{enrichment_stats['rows_enriched']} rows enriched, "
-        f"{enrichment_stats['ambiguous_pages']} ambiguous pages, "
-        f"{enrichment_stats['page_errors']} errors"
-    )
 
     if unpriced_slugs:
         preview = ", ".join(sorted(unpriced_slugs)[:12])
