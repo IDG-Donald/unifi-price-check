@@ -2,7 +2,9 @@
 """Fetch current UniFi Canada catalog pricing into an Excel-friendly CSV.
 
 This version uses the public JSON payloads that back the UniFi Store's Next.js
-category pages. It does not launch a browser or request every product page.
+category pages for product discovery, then fetches one normal HTML category page
+per logical category to capture the displayed base / "Surcharge incl." price pair.
+It does not launch a browser or request every product page.
 
 Failure behavior is intentionally conservative: a new CSV is written to a
 temporary file, validated, and only then atomically replaces the previous CSV.
@@ -25,6 +27,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 import requests
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -99,6 +102,16 @@ PRICE_TEXT_RE = re.compile(r"-?[0-9]+(?:[.,][0-9]+)?")
 SKUISH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+/-]{1,63}$")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
+SURCHARGE_PAIR_RE = re.compile(
+    r"(?P<from>\bFrom\s+)?\$\s*(?P<base>[0-9][0-9,]*(?:\.[0-9]{2})?)"
+    r"\s*\$\s*(?P<surcharge>[0-9][0-9,]*(?:\.[0-9]{2})?)"
+    r"\s*Surcharge\s*incl\.?",
+    re.IGNORECASE,
+)
+SINGLE_PRICE_RE = re.compile(
+    r"(?P<from>\bFrom\s+)?\$\s*(?P<price>[0-9][0-9,]*(?:\.[0-9]{2})?)",
+    re.IGNORECASE,
+)
 
 # UniFi's category payloads have used several description-ish keys over time.
 # Prefer the short customer-readable summary shown on category/product cards.
@@ -112,18 +125,33 @@ DESCRIPTION_KEYS = (
     "tagline",
 )
 
-# In the current storefront payload, `price` is the underlying/raw price while
-# `displayPrice` is the price presented to the shopper. During the Canadian
-# memory-surcharge period these can differ. Extra aliases are included so this
-# survives small API naming changes without silently losing the final price.
-BASE_PRICE_KEYS = ("basePrice", "priceBeforeSurcharge", "price")
-DISPLAY_PRICE_KEYS = (
+# The fast Next.js catalog payload is retained as the source for product
+# discovery, SKU, stock, description, and a usable current price. It does NOT
+# reliably expose the Canadian memory surcharge as a separate field.
+#
+# The true base/surcharge pair is therefore parsed from the rendered category
+# HTML, where UniFi explicitly displays e.g. "$400.00 $431.00 Surcharge incl.".
+JSON_PRICE_KEYS = (
+    "displayPrice",
+    "price",
+    "currentPrice",
+    "finalPrice",
     "surchargePrice",
     "priceWithSurcharge",
-    "displayPrice",
-    "finalPrice",
-    "currentPrice",
+    "basePrice",
+    "priceBeforeSurcharge",
 )
+
+
+@dataclass(frozen=True)
+class StorefrontPrice:
+    base_price_cad: Decimal
+    surcharge_price_cad: Decimal | None
+    price_type: str
+
+    @property
+    def quote_price_cad(self) -> Decimal:
+        return self.surcharge_price_cad or self.base_price_cad
 
 
 @dataclass(frozen=True)
@@ -215,6 +243,125 @@ def get_store_context(session: requests.Session) -> tuple[str, str]:
 
 def category_json_url(store_origin: str, build_id: str, route: str) -> str:
     return f"{store_origin}/_next/data/{build_id}/{REGION_PATH}/{route}.json"
+
+
+def category_page_url(store_origin: str, route: str) -> str:
+    return f"{store_origin}/{REGION_PATH}/{route}"
+
+
+def slug_from_product_href(href: str) -> str:
+    path = urlsplit(href).path.rstrip("/")
+    marker = "/products/"
+    if marker not in path:
+        return ""
+    return path.split(marker, 1)[1].split("/", 1)[0].strip()
+
+
+def decimal_from_price_text(value: str) -> Decimal | None:
+    try:
+        return Decimal(value.replace(",", "")).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def parse_storefront_price_text(text: str) -> StorefrontPrice | None:
+    """Parse the price wording used on UniFi category cards.
+
+    Examples:
+      $400.00 $431.00 Surcharge incl.
+      From $239.00 $257.00 Surcharge incl.
+      $199.00
+    """
+    normalized = WHITESPACE_RE.sub(" ", html.unescape(text)).strip()
+
+    pair = SURCHARGE_PAIR_RE.search(normalized)
+    if pair:
+        base = decimal_from_price_text(pair.group("base"))
+        surcharge = decimal_from_price_text(pair.group("surcharge"))
+        if base is not None and surcharge is not None and base > 0 and surcharge > 0:
+            return StorefrontPrice(
+                base_price_cad=base,
+                surcharge_price_cad=surcharge,
+                price_type="From" if pair.group("from") else "Exact",
+            )
+
+    single = SINGLE_PRICE_RE.search(normalized)
+    if single:
+        price = decimal_from_price_text(single.group("price"))
+        if price is not None and price > 0:
+            return StorefrontPrice(
+                base_price_cad=price,
+                surcharge_price_cad=None,
+                price_type="From" if single.group("from") else "Exact",
+            )
+
+    return None
+
+
+def nearest_product_card_price(anchor: Any) -> StorefrontPrice | None:
+    """Walk upward from a product link until a compact price-bearing card is found."""
+    node = anchor
+    for _ in range(10):
+        node = getattr(node, "parent", None)
+        if node is None:
+            break
+
+        # Category cards are compact. Refuse very large ancestors so a match
+        # cannot accidentally borrow a neighbouring product's price.
+        text = " ".join(node.stripped_strings)
+        if not text or len(text) > 5000:
+            continue
+
+        parsed = parse_storefront_price_text(text)
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def parse_category_html_prices(
+    html_text: str, known_slugs: set[str]
+) -> dict[str, StorefrontPrice]:
+    """Return displayed base/surcharge prices keyed by product slug."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    prices: dict[str, StorefrontPrice] = {}
+
+    for anchor in soup.find_all("a", href=True):
+        slug = slug_from_product_href(str(anchor.get("href") or ""))
+        if not slug or slug not in known_slugs or slug in prices:
+            continue
+
+        parsed = nearest_product_card_price(anchor)
+        if parsed is not None:
+            prices[slug] = parsed
+
+    return prices
+
+
+def fetch_category_html_prices(
+    session: requests.Session,
+    store_origin: str,
+    route: str,
+    products: list[dict[str, Any]],
+) -> dict[str, StorefrontPrice]:
+    """Fetch one rendered category HTML page and parse visible price pairs."""
+    known_slugs = {str(p.get("slug") or "").strip() for p in products}
+    known_slugs.discard("")
+    if not known_slugs:
+        return {}
+
+    url = category_page_url(store_origin, route)
+    response = session.get(url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "").lower()
+    if "html" not in content_type:
+        raise RuntimeError(
+            f"category page did not return HTML "
+            f"(status={response.status_code}, content-type={content_type!r}, url={response.url})"
+        )
+
+    return parse_category_html_prices(response.text, known_slugs)
 
 
 def looks_like_product(obj: dict[str, Any]) -> bool:
@@ -319,7 +466,7 @@ def fetch_category(
 
 
 def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
-    """Fetch all categories and deduplicate products by store slug."""
+    """Fetch JSON catalog plus one HTML price page per logical category."""
     build_id, store_origin = get_store_context(session)
     print(f"Store origin: {store_origin}")
     print(f"Store buildId: {build_id}")
@@ -330,6 +477,7 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
         print(f"Fetching category {index}/{len(CATEGORY_ROUTES)}: {category_label}")
 
         products: list[dict[str, Any]] | None = None
+        chosen_route: str | None = None
         route_errors: list[str] = []
 
         for route_index, route in enumerate(routes, start=1):
@@ -342,6 +490,7 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
                     route=route,
                 )
                 products = candidate_products
+                chosen_route = route
                 if route_index > 1:
                     print(f"  using fallback route: {route}")
                 break
@@ -368,17 +517,51 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
         if products is None:
             raise RuntimeError(f"{category_label} produced no product list")
 
+        html_prices: dict[str, StorefrontPrice] = {}
+        if products and chosen_route:
+            try:
+                html_prices = fetch_category_html_prices(
+                    session=session,
+                    store_origin=store_origin,
+                    route=chosen_route,
+                    products=products,
+                )
+                split_count = sum(
+                    1 for price in html_prices.values() if price.surcharge_price_cad is not None
+                )
+                print(
+                    f"  HTML pricing matched {len(html_prices)} product slugs; "
+                    f"{split_count} include a surcharge pair"
+                )
+            except Exception as exc:
+                # The JSON feed still supplies a usable current quote price. A
+                # transient HTML/layout problem therefore leaves surcharge fields
+                # blank instead of blocking the entire daily price refresh.
+                print(f"  WARNING: storefront HTML pricing overlay failed: {exc}")
+
         category_new = 0
         for product in products:
             slug = str(product.get("slug") or "").strip()
             if not slug:
                 continue
 
+            incoming = dict(product)
+            incoming["_category"] = category_label
+            if slug in html_prices:
+                incoming["_storefront_price"] = html_prices[slug]
+
             if slug not in by_slug:
-                product = dict(product)
-                product["_category"] = category_label
-                by_slug[slug] = product
+                by_slug[slug] = incoming
                 category_new += 1
+            else:
+                # A product may appear in several logical categories. Preserve
+                # the first catalog record, but enrich it if a later category
+                # provided the visible base/surcharge pair.
+                if (
+                    "_storefront_price" not in by_slug[slug]
+                    and "_storefront_price" in incoming
+                ):
+                    by_slug[slug]["_storefront_price"] = incoming["_storefront_price"]
 
         print(
             f"  received {len(products)} product records; "
@@ -388,7 +571,10 @@ def fetch_catalog(session: requests.Session) -> dict[str, dict[str, Any]]:
         if CATEGORY_DELAY_SECONDS > 0 and index < len(CATEGORY_ROUTES):
             time.sleep(CATEGORY_DELAY_SECONDS)
 
-    print(f"Fetched {len(by_slug)} unique products from {len(CATEGORY_ROUTES)} logical categories")
+    print(
+        f"Fetched {len(by_slug)} unique products from "
+        f"{len(CATEGORY_ROUTES)} logical categories"
+    )
     return by_slug
 
 
@@ -448,23 +634,20 @@ def first_money(mapping: dict[str, Any], keys: Iterable[str]) -> Decimal | None:
     return None
 
 
-def price_components(mapping: dict[str, Any]) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
-    """Return (base_price, surcharge/display_price, quote_price).
+def json_quote_price(mapping: dict[str, Any]) -> Decimal | None:
+    """Return the best usable current price from the Next.js JSON payload.
 
-    `quote_price` is the customer-facing current store price: display/surcharge
-    price when present, otherwise base price. Keeping these components separate
-    lets Excel use the final price while still retaining the underlying price.
+    This is deliberately a single price. We no longer infer base vs surcharge
+    from JSON fields because the current Canadian payload can expose the same
+    effective storefront price in both `price` and `displayPrice`.
     """
-    base_price = first_money(mapping, BASE_PRICE_KEYS)
-    surcharge_price = first_money(mapping, DISPLAY_PRICE_KEYS)
-    quote_price = surcharge_price or base_price
+    return first_money(mapping, JSON_PRICE_KEYS)
 
-    # Some payload shapes expose only displayPrice. Preserve a usable base value
-    # rather than leaving Base Price blank; Surcharge Price remains explicit.
-    if base_price is None and quote_price is not None:
-        base_price = quote_price
 
-    return base_price, surcharge_price, quote_price
+def storefront_price(product: dict[str, Any]) -> StorefrontPrice | None:
+    value = product.get("_storefront_price")
+    return value if isinstance(value, StorefrontPrice) else None
+
 
 
 def clean_description_text(value: Any) -> str:
@@ -600,20 +783,32 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
     category = str(product.get("_category") or "Unknown")
     base_name = product_name(product, slug)
     description = product_description(product)
+    visible_price = storefront_price(product)
     variants = [v for v in (product.get("variants") or []) if isinstance(v, dict)]
 
-    priced_variants: list[tuple[dict[str, Any], Decimal, Decimal | None, Decimal]] = []
+    priced_variants: list[tuple[dict[str, Any], Decimal]] = []
     for variant in variants:
-        base_price, surcharge_price, quote_price = price_components(variant)
-        if quote_price is None or quote_price <= 0 or base_price is None or base_price <= 0:
+        quote_price = json_quote_price(variant)
+        if quote_price is None or quote_price <= 0:
             continue
-        priced_variants.append((variant, base_price, surcharge_price, quote_price))
+        priced_variants.append((variant, quote_price))
 
     if not priced_variants:
-        # A few storefront product objects carry the price directly rather than
-        # under variants. Use the same base/display semantics.
-        base_price, surcharge_price, quote_price = price_components(product)
-        if quote_price is None or quote_price <= 0 or base_price is None or base_price <= 0:
+        # Some products carry price directly on the product object. Prefer the
+        # visible category-card price pair whenever available; otherwise retain
+        # the JSON quote price and leave the surcharge field blank.
+        json_price = json_quote_price(product)
+        if visible_price is not None:
+            base_price = visible_price.base_price_cad
+            surcharge_price = visible_price.surcharge_price_cad
+            quote_price = visible_price.quote_price_cad
+            price_type = visible_price.price_type
+        elif json_price is not None and json_price > 0:
+            base_price = json_price
+            surcharge_price = None
+            quote_price = json_price
+            price_type = "Exact"
+        else:
             return []
 
         sku, _is_real_sku = extract_sku(product, None, slug)
@@ -628,17 +823,27 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
                 category=category,
                 availability=aggregate_status(variants) if variants else "Unknown",
                 product_url=product_url(slug),
-                price_type="Exact",
+                price_type=price_type,
                 updated_utc=timestamp,
             )
         ]
 
     # If multiple variants expose distinct real SKUs, keep one row per SKU.
+    # A single category card cannot safely describe differently priced variants,
+    # so we apply its split price only when the card is Exact and all JSON
+    # variants currently agree on the same quote price.
+    distinct_json_prices = {item[1] for item in priced_variants}
+    safe_exact_overlay = (
+        visible_price is not None
+        and visible_price.price_type == "Exact"
+        and len(distinct_json_prices) == 1
+    )
+
     distinct_variant_rows: list[CatalogRow] = []
     seen_variant_skus: set[str] = set()
     real_variant_sku_count = 0
 
-    for variant, base_price, surcharge_price, quote_price in priced_variants:
+    for variant, json_price in priced_variants:
         sku, is_real_sku = extract_sku(product, variant, slug)
         if is_real_sku:
             real_variant_sku_count += 1
@@ -650,6 +855,18 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
         name = base_name
         if len(priced_variants) > 1 and label and label.lower() not in base_name.lower():
             name = f"{base_name} - {label}"
+
+        if safe_exact_overlay and visible_price is not None:
+            base_price = visible_price.base_price_cad
+            surcharge_price = visible_price.surcharge_price_cad
+            quote_price = visible_price.quote_price_cad
+        else:
+            # JSON remains authoritative for variant-specific quote pricing. Do
+            # not invent a base/surcharge split when the category card only says
+            # "From" or variants have genuinely different prices.
+            base_price = json_price
+            surcharge_price = None
+            quote_price = json_price
 
         distinct_variant_rows.append(
             CatalogRow(
@@ -670,16 +887,20 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
     if real_variant_sku_count == len(priced_variants):
         return distinct_variant_rows
 
-    # Otherwise expose one product row using the variant with the lowest final
-    # displayed price. Keeping all price components from that same variant avoids
-    # accidentally pairing the base price of one configuration with the display
-    # price of another.
-    _variant, base_price, surcharge_price, quote_price = min(
-        priced_variants, key=lambda item: item[3]
-    )
-    sku, _is_real_sku = extract_sku(product, None, slug)
-    distinct_prices = {item[3] for item in priced_variants}
+    # Otherwise expose one product-level row. This is exactly where the category
+    # card's "From" base/surcharge pair is most useful.
+    if visible_price is not None:
+        base_price = visible_price.base_price_cad
+        surcharge_price = visible_price.surcharge_price_cad
+        quote_price = visible_price.quote_price_cad
+        price_type = visible_price.price_type
+    else:
+        _variant, quote_price = min(priced_variants, key=lambda item: item[1])
+        base_price = quote_price
+        surcharge_price = None
+        price_type = "From" if len(distinct_json_prices) > 1 else "Exact"
 
+    sku, _is_real_sku = extract_sku(product, None, slug)
     return [
         CatalogRow(
             sku=sku,
@@ -691,7 +912,7 @@ def product_to_rows(product: dict[str, Any], timestamp: str) -> list[CatalogRow]
             category=category,
             availability=aggregate_status(variants),
             product_url=product_url(slug),
-            price_type="From" if len(distinct_prices) > 1 else "Exact",
+            price_type=price_type,
             updated_utc=timestamp,
         )
     ]
@@ -791,11 +1012,13 @@ def run() -> None:
         and row.surcharge_price_cad != row.base_price_cad
     )
     descriptions = sum(1 for row in rows if row.store_description)
+    html_price_products = sum(1 for product in products.values() if storefront_price(product))
 
     print(f"Success: wrote {len(rows)} rows to {OUTPUT_FILE}")
     print(f"Products without a usable price: {len(unpriced_slugs)}")
     print(f"Rows with a model/SKU instead of slug fallback: {real_sku_like}/{len(rows)}")
-    print(f"Rows with a separate base/display price: {surcharge_rows}/{len(rows)}")
+    print(f"Rows with a true base/surcharge split: {surcharge_rows}/{len(rows)}")
+    print(f"Products matched to storefront HTML pricing: {html_price_products}/{len(products)}")
     print(f"Rows with a store description: {descriptions}/{len(rows)}")
 
     if unpriced_slugs:
